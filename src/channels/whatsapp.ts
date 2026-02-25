@@ -10,7 +10,10 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
-import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, STORE_DIR } from '../config.js';
+import { sendAlert } from '../alert.js';
+import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, MAX_CONSECUTIVE_FAILURES, STORE_DIR } from '../config.js';
+import { isVoiceMessage, transcribeVoiceMessage } from '../transcription.js';
+import { synthesize } from '../tts.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -36,6 +39,7 @@ export class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  private consecutiveFailures = 0;
 
   private opts: WhatsAppChannelOpts;
 
@@ -63,6 +67,7 @@ export class WhatsAppChannel implements Channel {
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Chrome'),
+      version: [2, 3000, 1034028152],
     });
 
     this.sock.ev.on('connection.update', (update) => {
@@ -82,7 +87,17 @@ export class WhatsAppChannel implements Channel {
         this.connected = false;
         const reason = (lastDisconnect?.error as any)?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+        this.consecutiveFailures++;
+        logger.info({ reason, shouldReconnect, consecutiveFailures: this.consecutiveFailures, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+
+        if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          logger.error({ consecutiveFailures: this.consecutiveFailures, reason }, 'Too many consecutive failures — sending alert and exiting');
+          sendAlert(
+            `WhatsApp disconnected (${this.consecutiveFailures} failures)`,
+            `NanoClaw has failed to reconnect ${this.consecutiveFailures} times in a row.\n\nLast disconnect reason: ${reason}\nTimestamp: ${new Date().toISOString()}\n\nThe process will now exit. Systemd will restart it with a clean socket state.`,
+          ).finally(() => process.exit(1));
+          return;
+        }
 
         if (shouldReconnect) {
           logger.info('Reconnecting...');
@@ -100,6 +115,7 @@ export class WhatsAppChannel implements Channel {
         }
       } else if (connection === 'open') {
         this.connected = true;
+        this.consecutiveFailures = 0;
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
@@ -163,12 +179,20 @@ export class WhatsAppChannel implements Channel {
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
-          const content =
+          let content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption ||
             '';
+
+          // Transcribe voice messages
+          if (isVoiceMessage(msg)) {
+            const transcript = await transcribeVoiceMessage(msg, this.sock);
+            content = transcript
+              ? `[Voice: ${transcript}]`
+              : '[Voice message - transcription unavailable]';
+          }
           const sender = msg.key.participant || msg.key.remoteJid || '';
           const senderName = msg.pushName || sender.split('@')[0];
 
@@ -197,10 +221,42 @@ export class WhatsAppChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    // Prefix bot messages with assistant name so users know who's speaking.
-    // On a shared number, prefix is also needed in DMs (including self-chat)
-    // to distinguish bot output from user messages.
-    // Skip only when the assistant has its own dedicated phone number.
+    // Split text into segments: plain text and <voice> blocks
+    const segments = this.parseVoiceSegments(text);
+
+    for (const segment of segments) {
+      if (segment.type === 'voice') {
+        await this.sendVoiceNote(jid, segment.text);
+      } else {
+        await this.sendTextMessage(jid, segment.text);
+      }
+    }
+  }
+
+  private parseVoiceSegments(text: string): Array<{ type: 'text' | 'voice'; text: string }> {
+    const segments: Array<{ type: 'text' | 'voice'; text: string }> = [];
+    const regex = /<voice>([\s\S]*?)<\/voice>/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+      // Text before this voice tag
+      const before = text.slice(lastIndex, match.index).trim();
+      if (before) segments.push({ type: 'text', text: before });
+      // Voice content
+      const voiceText = match[1].trim();
+      if (voiceText) segments.push({ type: 'voice', text: voiceText });
+      lastIndex = regex.lastIndex;
+    }
+
+    // Remaining text after last voice tag
+    const remaining = text.slice(lastIndex).trim();
+    if (remaining) segments.push({ type: 'text', text: remaining });
+
+    return segments;
+  }
+
+  private async sendTextMessage(jid: string, text: string): Promise<void> {
     const prefixed = ASSISTANT_HAS_OWN_NUMBER
       ? text
       : `${ASSISTANT_NAME}: ${text}`;
@@ -214,9 +270,29 @@ export class WhatsAppChannel implements Channel {
       await this.sock.sendMessage(jid, { text: prefixed });
       logger.info({ jid, length: prefixed.length }, 'Message sent');
     } catch (err) {
-      // If send fails, queue it for retry on reconnect
       this.outgoingQueue.push({ jid, text: prefixed });
       logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
+    }
+  }
+
+  private async sendVoiceNote(jid: string, text: string): Promise<void> {
+    try {
+      const audio = await synthesize(text);
+      if (!this.connected) {
+        // Can't queue voice notes — fall back to text
+        logger.warn({ jid }, 'WA disconnected, sending voice as text fallback');
+        await this.sendTextMessage(jid, text);
+        return;
+      }
+      await this.sock.sendMessage(jid, {
+        audio,
+        ptt: true,
+        mimetype: 'audio/ogg; codecs=opus',
+      });
+      logger.info({ jid, textLength: text.length, audioBytes: audio.length }, 'Voice note sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'TTS failed, falling back to text');
+      await this.sendTextMessage(jid, text);
     }
   }
 
