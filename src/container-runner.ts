@@ -1,6 +1,6 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Docker container and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
@@ -17,12 +17,15 @@ import {
 } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { emit as monitorEmit } from './monitor.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const EVENT_START_MARKER = '---NANOCLAW_EVENT_START---';
+const EVENT_END_MARKER = '---NANOCLAW_EVENT_END---';
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -88,7 +91,7 @@ function buildVolumeMounts(
     });
 
     // Global memory directory (read-only for non-main)
-    // Apple Container only supports directory mounts, not file mounts
+    // Docker bind mounts work with both files and directories
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
       mounts.push({
@@ -121,6 +124,13 @@ function buildVolumeMounts(
         // Enable Claude's memory feature (persists user preferences between sessions)
         // https://code.claude.com/docs/en/memory#manage-auto-memory
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+      },
+      mcpServers: {
+        'wayback-machine': {
+          command: 'node',
+          args: ['/home/devel12/nanoclaw/mcp/wayback-machine/index.js'],
+          type: 'stdio',
+        },
       },
     }, null, 2) + '\n');
   }
@@ -160,13 +170,23 @@ function buildVolumeMounts(
   });
 
   // Mount agent-runner source from host — recompiled on container startup.
-  // Bypasses Apple Container's sticky build cache for code changes.
+  // Ensures code changes are picked up without rebuilding the image.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   mounts.push({
     hostPath: agentRunnerSrc,
     containerPath: '/app/src',
     readonly: true,
   });
+
+  // Mount MCP servers so they're accessible inside the container
+  const mcpDir = path.join(projectRoot, 'mcp');
+  if (fs.existsSync(mcpDir)) {
+    mounts.push({
+      hostPath: mcpDir,
+      containerPath: '/home/devel12/nanoclaw/mcp',
+      readonly: true,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -186,11 +206,14 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'RUBE_MCP_TOKEN', 'PERPLEXITY_API_KEY', 'HAPPENSTANCE_API_KEY', 'YC_SESSION_COOKIE', 'YC_USER_ID', 'CRUSTDATA_API_KEY']);
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const args: string[] = ['run', '-i', '--rm', '--name', containerName,
+    // Allow container to reach host services (e.g. Bareos Director on port 9101)
+    '--add-host=host.docker.internal:host-gateway',
+  ];
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -202,13 +225,10 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
     args.push('-e', 'HOME=/home/node');
   }
 
-  // Apple Container: --mount for readonly, -v for read-write
+  // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
     if (mount.readonly) {
-      args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      );
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
     } else {
       args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
     }
@@ -257,12 +277,13 @@ export async function runContainerAgent(
     },
     'Spawning container agent',
   );
+  monitorEmit(group.folder, 'server', 'spawn', `Container ${containerName} (${mounts.length} mounts, session: ${input.sessionId || 'new'})`);
 
   const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn('docker', containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -282,6 +303,7 @@ export async function runContainerAgent(
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
+    let eventParseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
@@ -335,6 +357,30 @@ export async function runContainerAgent(
           }
         }
       }
+
+      // Stream-parse for monitor event markers (best-effort, separate from output)
+      eventParseBuffer += chunk;
+      let evStartIdx: number;
+      while ((evStartIdx = eventParseBuffer.indexOf(EVENT_START_MARKER)) !== -1) {
+        const evEndIdx = eventParseBuffer.indexOf(EVENT_END_MARKER, evStartIdx);
+        if (evEndIdx === -1) break;
+
+        const evJson = eventParseBuffer
+          .slice(evStartIdx + EVENT_START_MARKER.length, evEndIdx)
+          .trim();
+        eventParseBuffer = eventParseBuffer.slice(evEndIdx + EVENT_END_MARKER.length);
+
+        try {
+          const ev = JSON.parse(evJson) as { type: string; subtype: string; summary: string };
+          monitorEmit(group.folder, ev.type, ev.subtype, ev.summary);
+        } catch {
+          // best-effort — silently drop malformed events
+        }
+      }
+      // Prevent unbounded growth if no markers found
+      if (eventParseBuffer.length > 10000 && eventParseBuffer.indexOf(EVENT_START_MARKER) === -1) {
+        eventParseBuffer = '';
+      }
     });
 
     container.stderr.on('data', (data) => {
@@ -369,7 +415,7 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      exec(`docker stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');
@@ -502,6 +548,7 @@ export async function runContainerAgent(
           },
           'Container exited with error',
         );
+        monitorEmit(group.folder, 'server', 'error', `Container exit code ${code}: ${stderr.slice(-200)}`);
 
         resolve({
           status: 'error',
@@ -518,6 +565,7 @@ export async function runContainerAgent(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
           );
+          monitorEmit(group.folder, 'server', 'done', `Container done (${Math.round(duration / 1000)}s)`);
           resolve({
             status: 'success',
             result: null,

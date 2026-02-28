@@ -201,6 +201,21 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
+        // If a 'once' task is overdue by more than 1 hour, it already ran but
+        // the process was killed before updateTaskAfterRun could be called.
+        // Mark it completed instead of re-running it.
+        if (currentTask.schedule_type === 'once' && currentTask.next_run) {
+          const overdueMs = Date.now() - new Date(currentTask.next_run).getTime();
+          if (overdueMs > 60 * 60 * 1000) {
+            logger.warn(
+              { taskId: currentTask.id, overdueMs },
+              'Once task overdue by >1h, marking completed (likely ran before restart)',
+            );
+            updateTaskAfterRun(currentTask.id, null, 'Completed (recovered after restart)');
+            continue;
+          }
+        }
+
         deps.queue.enqueueTask(
           currentTask.chat_jid,
           currentTask.id,

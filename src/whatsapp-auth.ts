@@ -61,6 +61,7 @@ async function connectSocket(phoneNumber?: string, isReconnect = false): Promise
     printQRInTerminal: false,
     logger,
     browser: Browsers.macOS('Chrome'),
+    version: [2, 3000, 1034028152],
   });
 
   if (usePairingCode && phoneNumber && !state.creds.me) {

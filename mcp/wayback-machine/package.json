@@ -1,0 +1,11 @@
+{
+  "name": "wayback-machine-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "wayback-machine-mcp": "./index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

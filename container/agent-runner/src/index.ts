@@ -113,6 +113,15 @@ function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_END_MARKER);
 }
 
+const EVENT_START_MARKER = '---NANOCLAW_EVENT_START---';
+const EVENT_END_MARKER = '---NANOCLAW_EVENT_END---';
+
+function writeEvent(type: string, subtype: string, summary: string): void {
+  console.log(EVENT_START_MARKER);
+  console.log(JSON.stringify({ type, subtype, summary }));
+  console.log(EVENT_END_MARKER);
+}
+
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
@@ -187,7 +196,7 @@ function createPreCompactHook(): HookCallback {
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'RUBE_MCP_TOKEN', 'PERPLEXITY_API_KEY', 'HAPPENSTANCE_API_KEY', 'YC_SESSION_COOKIE', 'YC_USER_ID'];
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -416,6 +425,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: 'claude-sonnet-4-6',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -431,9 +441,14 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__rube__*',
+        'mcp__perplexity__*',
+        'mcp__happenstance__*',
+        'mcp__bookface__*'
       ],
       env: sdkEnv,
+      maxThinkingTokens: 10000,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -447,6 +462,43 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...(sdkEnv.RUBE_MCP_TOKEN ? {
+          rube: {
+            type: 'http' as const,
+            url: 'https://rube.app/mcp',
+            headers: {
+              Authorization: `Bearer ${sdkEnv.RUBE_MCP_TOKEN}`,
+            },
+          },
+        } : {}),
+        ...(sdkEnv.PERPLEXITY_API_KEY ? {
+          perplexity: {
+            command: 'npx',
+            args: ['-y', 'perplexity-mcp'],
+            env: {
+              PERPLEXITY_API_KEY: sdkEnv.PERPLEXITY_API_KEY,
+            },
+          },
+        } : {}),
+        ...(sdkEnv.HAPPENSTANCE_API_KEY ? {
+          happenstance: {
+            command: 'node',
+            args: ['/home/devel12/nanoclaw/mcp/happenstance/index.js'],
+            env: {
+              HAPPENSTANCE_API_KEY: sdkEnv.HAPPENSTANCE_API_KEY,
+            },
+          },
+        } : {}),
+        ...(sdkEnv.YC_SESSION_COOKIE ? {
+          bookface: {
+            command: 'node',
+            args: ['/home/devel12/nanoclaw/mcp/yc-bookface/dist/index.js'],
+            env: {
+              YC_SESSION_COOKIE: sdkEnv.YC_SESSION_COOKIE,
+              ...(sdkEnv.YC_USER_ID ? { YC_USER_ID: sdkEnv.YC_USER_ID } : {}),
+            },
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
@@ -462,9 +514,52 @@ async function runQuery(
       lastAssistantUuid = (message as { uuid: string }).uuid;
     }
 
+    // Emit monitor events for assistant content blocks
+    if (message.type === 'assistant' && 'message' in message) {
+      const msg = message as { message: { content: Array<{ type: string; thinking?: string; text?: string; name?: string; input?: unknown }> } };
+      for (const block of msg.message.content || []) {
+        if (block.type === 'thinking' && block.thinking) {
+          writeEvent('assistant', 'thinking', block.thinking.slice(0, 500));
+        } else if (block.type === 'text' && block.text) {
+          writeEvent('assistant', 'text', block.text.slice(0, 500));
+        } else if (block.type === 'tool_use' && block.name) {
+          const inputStr = block.input ? JSON.stringify(block.input) : '';
+          writeEvent('assistant', 'tool_use', `${block.name}(${inputStr.slice(0, 300)})`);
+        }
+      }
+    }
+
+    // Emit tool results from user messages (tool execution results)
+    if (message.type === 'user' && 'message' in message) {
+      const userMsg = message as { message: { content?: unknown }; tool_use_result?: unknown };
+      const content = userMsg.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block === 'object' && 'type' in block && block.type === 'tool_result') {
+            const resultBlock = block as { tool_use_id?: string; content?: string | Array<{ type?: string; text?: string }> };
+            const text = typeof resultBlock.content === 'string'
+              ? resultBlock.content
+              : Array.isArray(resultBlock.content)
+                ? resultBlock.content.filter(c => c.type === 'text').map(c => c.text || '').join('')
+                : '';
+            if (text) {
+              writeEvent('assistant', 'tool_result', text.slice(0, 2000));
+            }
+          }
+        }
+      }
+    }
+
+    // Emit tool use summaries (SDK-generated summary of tool execution)
+    if (message.type === 'tool_use_summary' && 'summary' in message) {
+      const summary = (message as { summary: string }).summary;
+      writeEvent('assistant', 'tool_result', summary.slice(0, 2000));
+    }
+
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      writeEvent('system', 'init', `Session: ${newSessionId}`);
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -476,6 +571,7 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      writeEvent('result', 'result', textResult ? textResult.slice(0, 200) : '(done)');
       writeOutput({
         status: 'success',
         result: textResult || null,

@@ -23,7 +23,16 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Add Bareos repository and install bconsole
+RUN curl -fsSL https://download.bareos.org/current/Debian_12/add_bareos_repositories.sh | bash \
+    && apt-get update && apt-get install -y bareos-bconsole \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy bconsole configuration (connects to Director on Docker host)
+COPY bconsole.conf /etc/bareos/bconsole.conf
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
