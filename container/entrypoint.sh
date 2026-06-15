@@ -13,4 +13,14 @@ set -e
 
 cat > /tmp/input.json
 
+# Load per-group secrets (e.g. DEEPLINE_API_KEY, EXA_API_KEY) from the mounted
+# .claude dir. Exported env propagates to the agent-runner and the Bash tool's
+# subprocesses (deepline CLI, last30days). Secrets live in the per-group
+# .claude-shared mount — never baked into the image.
+if [ -f /home/node/.claude/secrets.env ]; then
+  set -a
+  . /home/node/.claude/secrets.env
+  set +a
+fi
+
 exec bun run /app/src/index.ts < /tmp/input.json
