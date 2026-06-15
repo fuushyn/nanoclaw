@@ -11,6 +11,12 @@ const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ON
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+// Consecutive channel reconnect failures before sendAlert() fires and the
+// process exits so the service manager restarts it with a clean socket.
+export const MAX_CONSECUTIVE_FAILURES = parseInt(
+  process.env.MAX_CONSECUTIVE_FAILURES || '10',
+  10,
+);
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
