@@ -115,6 +115,24 @@ RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# ---- Andy research tooling (fork customization) ------------------------------
+# Adds: uv+Python (last30days skill), deepline CLI (npm), and the
+# yc-bookface-mcp + last30days-skill repos under /opt. Secrets are NOT baked —
+# they arrive via MCP-server env and a mounted secrets dir at runtime.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+# uv manages Python 3.12+ for the last30days skill
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+# Deepline CLI (talks to code.deepline.com; auth via mounted config)
+RUN npm install -g deepline@latest
+# Bookface MCP server (Node) + last30days skill (Python)
+RUN git clone --depth 1 https://github.com/fuushyn/yc-bookface-mcp.git /opt/yc-bookface-mcp \
+    && cd /opt/yc-bookface-mcp && npm install --no-audit --no-fund
+RUN git clone --depth 1 https://github.com/mvanhorn/last30days-skill.git /opt/last30days-skill
+RUN chown -R node:node /opt/yc-bookface-mcp /opt/last30days-skill
+
 # ---- Workspace + permissions -------------------------------------------------
 RUN mkdir -p /workspace/group /workspace/extra && \
     chown -R node:node /workspace && \
