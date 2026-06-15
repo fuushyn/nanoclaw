@@ -38,8 +38,9 @@ import {
 } from '@whiskeysockets/baileys';
 import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeysockets/baileys';
 
+import { sendAlert } from '../alert.js';
 import { isSafeAttachmentName } from '../attachment-safety.js';
-import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR } from '../config.js';
+import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR, MAX_CONSECUTIVE_FAILURES } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -282,6 +283,7 @@ registerChannelAdapter('whatsapp', {
     let sock: WASocket;
     let connected = false;
     let shuttingDown = false;
+    let consecutiveFailures = 0;
     let setupConfig: ChannelSetup;
 
     // LID → phone JID mapping (WhatsApp's new ID system)
@@ -565,7 +567,33 @@ registerChannelAdapter('whatsapp', {
           // and forcing a fresh QR pairing on next start.
           const shouldReconnect = !shuttingDown && reason !== DisconnectReason.loggedOut;
 
-          log.info('WhatsApp connection closed', { reason, shouldReconnect, shuttingDown });
+          // Count only unexpected disconnects (not logout / clean shutdown).
+          if (shouldReconnect) {
+            consecutiveFailures++;
+          }
+
+          log.info('WhatsApp connection closed', {
+            reason,
+            shouldReconnect,
+            shuttingDown,
+            consecutiveFailures,
+          });
+
+          if (shouldReconnect && consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            log.error('Too many consecutive WhatsApp failures — alerting and exiting', {
+              consecutiveFailures,
+              reason,
+            });
+            void sendAlert(
+              `WhatsApp disconnected (${consecutiveFailures} failures)`,
+              `NanoClaw has failed to reconnect ${consecutiveFailures} times in a row.\n\n` +
+                `Last disconnect reason: ${reason}\n` +
+                `Timestamp: ${new Date().toISOString()}\n\n` +
+                `The process will now exit. The service manager will restart it ` +
+                `with a clean socket state.`,
+            ).finally(() => process.exit(1));
+            return;
+          }
 
           if (shouldReconnect) {
             log.info('Reconnecting...');
@@ -610,6 +638,7 @@ registerChannelAdapter('whatsapp', {
           }
         } else if (connection === 'open') {
           connected = true;
+          consecutiveFailures = 0;
           log.info('Connected to WhatsApp');
 
           // Clean up pairing code file after successful connection
